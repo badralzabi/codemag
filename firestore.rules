@@ -1,0 +1,204 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // دالة مساعدة للتحقق مما إذا كان المستخدم مسجلاً للدخول
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isBlockedBy(uid, otherUid) {
+      return exists(/databases/$(database)/documents/users/$(uid)) &&
+             ('blockedUsers' in get(/databases/$(database)/documents/users/$(uid)).data) &&
+             (otherUid in get(/databases/$(database)/documents/users/$(uid)).data.blockedUsers);
+    }
+
+    function isBlocked(uid1, uid2) {
+      return isBlockedBy(uid1, uid2) || isBlockedBy(uid2, uid1);
+    }
+
+    // ==========================================
+    // 1. قواعد المستخدمين (Users)
+    // ==========================================
+    match /users/{userId} {
+      // السماح بالقراءة لجميع المستخدمين المسجلين (مهم جداً لكي يعمل البحث والاستكشاف!)
+      allow read: if isAuthenticated();
+      // السماح بإنشاء أو حذف حساب لنفس الشخص
+      allow create, delete: if isAuthenticated() && request.auth.uid == userId;
+      // السماح بالتحديث:
+      // 1. للمستخدم نفسه لتعديل بياناته
+      // 2. للمستخدمين الآخرين لإضافته/حذفه من المتابعة أو لتعديل نقاطه (نظام إرسال النقاط الآمن)
+      allow update: if isAuthenticated() && (
+        request.auth.uid == userId ||
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['followers', 'followRequests', 'buddyPoints', 'following'])
+      );
+    }
+
+    // قواعد الهدايا الخاصة بالمستخدم (الجديد المضاف)
+    match /users/{userId}/gifts/{giftId} {
+      allow read, write: if isAuthenticated();
+    }
+
+    // ==========================================
+    // 2. قواعد المنشورات (Posts)
+    // ==========================================
+    match /posts/{postId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && request.resource.data.authorId == request.auth.uid;
+      // السماح بالتحديث للجميع (لتعديل المنشور نفسه، والإعجاب، وزيادة عداد التعليقات)
+      allow update: if isAuthenticated();
+      allow delete: if isAuthenticated() && resource.data.authorId == request.auth.uid;
+    }
+
+    // ==========================================
+    // 3. قواعد التعليقات (Comments)
+    // ==========================================
+    match /comments/{commentId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && request.resource.data.authorId == request.auth.uid;
+      allow update, delete: if isAuthenticated() && resource.data.authorId == request.auth.uid;
+    }
+
+    // ==========================================
+    // 4. قواعد غرف المحادثة (Chat Rooms)
+    // ==========================================
+    match /chatRooms/{roomId} {
+      // السماح بالقراءة لغرفة المحادثة إذا كان المستخدم جزءاً منها
+      allow read: if isAuthenticated() && (request.auth.uid in resource.data.users);
+      // السماح بالتحديث والحذف لغرفة المحادثة إذا كان جزءاً منها ولم يحظر أي منهما الآخر
+      allow update, delete: if isAuthenticated() && (request.auth.uid in resource.data.users) &&
+                            !isBlocked(resource.data.users[0], resource.data.users[1]);
+      // السماح بإنشاء غرفة محادثة جديدة إذا كان المستخدم أحد أطرافها ولم يحظر أي منهما الآخر
+      allow create: if isAuthenticated() && (request.auth.uid in request.resource.data.users) &&
+                    !isBlocked(request.resource.data.users[0], request.resource.data.users[1]);
+    }
+
+    // ==========================================
+    // 5. قواعد الرسائل (Messages)
+    // ==========================================
+    match /messages/{messageId} {
+      allow read: if isAuthenticated() && 
+                  (!exists(/databases/$(database)/documents/chatRooms/$(resource.data.roomId)) ||
+                   request.auth.uid in get(/databases/$(database)/documents/chatRooms/$(resource.data.roomId)).data.users);
+      
+      allow create: if isAuthenticated() && 
+                    request.resource.data.senderId == request.auth.uid &&
+                    exists(/databases/$(database)/documents/chatRooms/$(request.resource.data.roomId)) &&
+                    (request.auth.uid in get(/databases/$(database)/documents/chatRooms/$(request.resource.data.roomId)).data.users) &&
+                    !isBlocked(
+                      get(/databases/$(database)/documents/chatRooms/$(request.resource.data.roomId)).data.users[0],
+                      get(/databases/$(database)/documents/chatRooms/$(request.resource.data.roomId)).data.users[1]
+                    );
+                    
+      allow update: if isAuthenticated() &&
+                    (!exists(/databases/$(database)/documents/chatRooms/$(resource.data.roomId)) ||
+                     (request.auth.uid in get(/databases/$(database)/documents/chatRooms/$(resource.data.roomId)).data.users));
+                     
+      allow delete: if isAuthenticated();
+    }
+
+    // ==========================================
+    // 6. قواعد الإشعارات (Notifications)
+    // ==========================================
+    match /notifications/{notificationId} {
+      allow read, update, delete: if isAuthenticated() && resource.data.receiverId == request.auth.uid;
+      allow create: if isAuthenticated();
+    }
+
+    // ==========================================
+    // 7. قواعد القصص (Stories)
+    // ==========================================
+    match /stories/{storyId} {
+      // يمكن لأي شخص مسجل الدخول قراءة القصص
+      allow read: if isAuthenticated();
+      // لا يتم الإنشاء إلا إذا كان صانع القصة هو المستخدم نفسه
+      allow create: if isAuthenticated() && request.resource.data.authorId == request.auth.uid;
+      // السماح بالتحديث لجميع المستخدمين (من أجل تسجيل من شاهد القصة، وإرسال التفاعلات/Reactions)
+      allow update: if isAuthenticated();
+      // الحذف مسموح فقط لصاحب القصة
+      allow delete: if isAuthenticated() && resource.data.authorId == request.auth.uid;
+    }
+    
+    // ==========================================
+    // 8. قواعد أسماء المستخدمين (Usernames)
+    // ==========================================
+    match /usernames/{username} {
+      // السماح للجميع بقراءة الأسماء للتحقق من توفرها قبل التسجيل
+      allow read: if true;
+      // السماح بحجز الاسم فقط إذا لم يكن محجوزاً مسبقاً
+      allow create: if isAuthenticated() && !exists(/databases/$(database)/documents/usernames/$(username));
+      // منع التعديل على اسم محجوز
+      allow update: if false;
+      // السماح بحذف الاسم فقط لمن يملكه (لإتاحة تغيير اليوزر مستقبلاً)
+      allow delete: if isAuthenticated() && resource.data.uid == request.auth.uid;
+    }
+
+    // ==========================================
+    // 9. قواعد الريلز (Reels)
+    // ==========================================
+    match /reels/{reelId} {
+      allow read: if isAuthenticated();
+      // السماح بتحديث وتكوين ريل لإضافة لايكات وأعداد تعليقات
+      allow create, update: if isAuthenticated();
+      
+      // قواعد التعليقات داخل الريل
+      match /comments/{commentId} {
+        allow read: if isAuthenticated();
+        allow create: if isAuthenticated() && request.resource.data.authorId == request.auth.uid;
+        allow update, delete: if isAuthenticated() && resource.data.authorId == request.auth.uid;
+      }
+    }
+
+    // ==========================================
+    // 10. قواعد المكالمات (Calls)
+    // ==========================================
+    match /calls/{userId} {
+      allow create: if isAuthenticated();
+      allow read, update, delete: if isAuthenticated() && request.auth.uid == userId;
+      allow delete: if isAuthenticated(); 
+    }
+
+    // ==========================================
+    // 11. قواعد الألعاب المصغرة (Games)
+    // ==========================================
+    match /games/{gameId} {
+      allow read, write: if isAuthenticated() && (
+        resource == null || 
+        request.auth.uid == resource.data.playerX || 
+        request.auth.uid == resource.data.playerO ||
+        request.auth.uid == request.resource.data.playerX ||
+        request.auth.uid == request.resource.data.playerO
+      );
+    }
+
+    // ==========================================
+    // 12. قواعد الجلسات المشتركة (Watch Sessions)
+    // ==========================================
+    match /watchSessions/{sessionId} {
+      allow read, write: if isAuthenticated() && (
+        resource == null ||
+        request.auth.uid in resource.data.users ||
+        request.auth.uid in request.resource.data.users
+      );
+    }
+
+    // ==========================================
+    // 13. قواعد خريطة المواقع الجغرافية (Locations)
+    // ==========================================
+    match /locations/{userId} {
+      // يسمح للمستخدم بكتابة وتحديث موقعه الخاص وإعداداته الجغرافية
+      allow write: if isAuthenticated() && request.auth.uid == userId;
+      
+      // يسمح بقراءة الموقع فقط إذا كان المستخدم مسجلاً للدخول وكان يملك علاقة متابعة مشتركة مع الطرف الآخر
+      allow read: if isAuthenticated() && (
+        request.auth.uid == userId || 
+        (
+          exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+          userId in get(/databases/$(database)/documents/users/$(request.auth.uid)).data.following &&
+          request.auth.uid in get(/databases/$(database)/documents/users/$(userId)).data.following
+        )
+      );
+    }
+  }
+}
